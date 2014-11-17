@@ -1,0 +1,4 @@
+#!/bin/bash
+set minecraftDir="/home/max/.minecraft/"
+cd $(dirname "${minecraftDir}")
+java -Xmx1024M -Xms512M -cp Minecraft.jar net.minecraft.bootstrap.Bootstrap
