@@ -1,0 +1,177 @@
+#!/usr/bin/env python
+import argparse
+import subprocess
+import os
+
+
+def editor(env, override, default):
+    if override:
+        return override
+    return env.get('EDITOR', default)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-e', '--editor', help='Force use of this editor')
+
+    subparsers = parser.add_subparsers(dest='command')
+    start_parser = subparsers.add_parser('start')
+    start_parser.add_argument('base')
+    start_parser.add_argument('targets', nargs='*')
+
+    update_parser = subparsers.add_parser('update')
+    update_parser.add_argument('targets', nargs='*')
+    update_parser.add_argument('--commits', '-c', nargs='*', default=['HEAD'])
+
+    return parser.parse_args()
+
+
+def get_branch():
+    out = subprocess.check_output(['git', 'branch'])
+    original_branch = None
+    for l in out.splitlines():
+        if l.startswith('*'):
+            original_branch = l[2:]
+    if original_branch is None:
+        raise Exception('could not find branch name')
+    return original_branch
+
+
+def get_branch_parts(branch):
+    ticket_name = '-'.join(branch.split('-')[:2])
+    base_branch = branch.split('-')[2]
+    desc = '-'.join(branch.split('-')[3:])
+    return ticket_name, base_branch, desc
+
+
+def format_branch_name(ticket, base, desc):
+    return '{}-{}-{}'.format(ticket, base, desc)
+
+
+def start(args):
+    e = editor(os.environ, args.editor, 'vi')
+    original_branch = get_branch()
+    ticket_name, base_branch, desc = get_branch_parts(original_branch)
+    if base_branch != args.base:
+        raise Exception(
+            'Expected base_branch to be {} but current branch is based off of {}'.format(
+                args.base, base_branch))
+    pr_file = 'pr-{}-{}.txt'.format(ticket_name, desc)
+    if not os.path.isfile(pr_file):
+        with open(pr_file, 'w') as f:
+            f.write('''\
+{ticket_name} 
+
+https://deepfield.atlassian.net/browse/{ticket_name}
+
+'''.format(ticket_name=ticket_name))
+    cmd = [e, pr_file]
+    subprocess.check_call(cmd)
+
+    def make_pr(base, branch):
+        subprocess.check_call(['git', 'push', '-u', 'origin', branch])
+        hub_command = ['hub', 'pull-request', '-F', pr_file, '-b', base, '-o']
+        print hub_command
+        try:
+            p = subprocess.Popen(hub_command, stderr=subprocess.PIPE)
+        except OSError as e:
+            if e.errno == 2:
+                print 'You do not have hub installed, follow the instructions here'
+                print 'https://github.com/github/hub'
+            raise
+        _, stderr, = p.communicate()
+        retcode = p.wait()
+        print stderr
+        if retcode != 0:
+            if 'A pull request already exists for' in stderr:
+                cont_resp = raw_input(
+                    'PR already exists for branch {}. continue? ([y]/n): '.format(
+                        base)).lower()
+                if cont_resp and cont_resp not in 'yes':
+                    return
+            else:
+                raise subprocess.CalledProcessError(retcode, hub_command, None)
+
+    make_pr(args.base, original_branch)
+
+    for rebase_base, rebase_target in zip([args.base] + args.targets[:-1],
+                                          args.targets):
+        rebased_branch = format_branch_name(ticket_name, rebase_target, desc)
+        git_command = ['git', 'checkout', '-b', rebased_branch]
+        p = subprocess.Popen(['git', 'checkout', '-b', rebased_branch], stderr=subprocess.PIPE)
+        _, stderr = p.communicate()
+        retcode = p.wait()
+        print stderr
+        if retcode != 0:
+            if 'already exists.' not in stderr:
+                raise subprocess.CalledProcessError(retcode, git_command, None)
+            delete_resp = raw_input('Branch already exists {}. delete it? ([y]/n): '.format(rebased_branch)).lower()
+            if delete_resp and not 'yes'.startswith(delete_resp):
+                return
+            subprocess.check_call(['git', 'branch', '-D', rebased_branch])
+            subprocess.check_call(git_command)
+        origin_base = 'origin/{}'.format(rebase_base)
+        subprocess.check_call(['git', 'merge', origin_base])
+        origin_target = 'origin/{}'.format(rebase_target)
+        subprocess.check_call(
+            ['git', 'rebase', '--onto', origin_target, origin_base])
+        make_pr(rebase_target, rebased_branch)
+
+
+def update(args):
+    def cherry_pick(commit_hashes):
+        git_command = ['git', 'cherry-pick'] + commit_hashes
+        p = subprocess.Popen(git_command, stderr=subprocess.PIPE)
+        _, stderr, = p.communicate()
+        retcode = p.wait()
+        print stderr
+        # if retcode != 0:
+        #     if 'git commit --allow-empty' not in stderr:
+        raise subprocess.CalledProcessError(retcode, git_command, None)
+
+    ticket_name, base_branch, desc = get_branch_parts(get_branch())
+
+    if not args.commits:
+        commits = ['HEAD']
+    else:
+        commits = args.commits
+
+    commits = []
+    for commit in args.commits:
+        git_command = ['git', 'rev-parse', commit]
+        p = subprocess.Popen(git_command, stdout=subprocess.PIPE)
+        stdout, _ = p.communicate()
+        retcode = p.wait()
+        print stdout
+        if retcode != 0:
+            raise subprocess.CalledProcessError(retcode, git_command, None)
+        commit_lines = stdout.strip().splitlines()
+        if len(commit_lines) == 2:
+            commit_lines[1] = commit_lines[1][1:]
+        resolved_commit = '..'.join(reversed(commit_lines))
+        print resolved_commit
+        commits.append(resolved_commit)
+
+    print commits
+
+
+    subprocess.check_call(['git', 'push'])
+    for target_base_branch in args.targets[1:]:
+        target_branch = format_branch_name(ticket_name, target_base_branch,
+                                           desc)
+        subprocess.check_call(['git', 'checkout', target_branch])
+        cherry_pick(commits)
+        subprocess.check_call(['git', 'push'])
+
+
+def main():
+    args = parse_args()
+
+    {
+        'start': start,
+        'update': update,
+    }[args.command](args)
+
+
+if __name__ == '__main__':
+    main()
